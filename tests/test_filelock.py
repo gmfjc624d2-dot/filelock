@@ -2202,11 +2202,52 @@ def test_forced_release_drops_all_holds(tmp_path: Path) -> None:
     assert lock.lock_counter == 0
 
 
+def _fail_next_unlock(mocker: MockerFixture, fd: int) -> None:  # pragma: needs fcntl
+    # flock is patched process-wide, so a queued side_effect hands its failure to whichever thread calls flock first,
+    # such as a worker an earlier failing test left running. Fail only this descriptor's next unlock and pass every
+    # other call through to the real flock.
+    assert sys.platform != "win32"  # typeshed hides fcntl's members off POSIX
+    import fcntl
+
+    real_flock: Final = fcntl.flock
+    pending: Final = [OSError(EIO, "unlock failed")]
+
+    def flock(target: int, operation: int) -> None:
+        if target == fd and operation == fcntl.LOCK_UN and pending:
+            raise pending.pop()
+        real_flock(target, operation)
+
+    mocker.patch("filelock._unix.fcntl.flock", side_effect=flock)
+
+
+@NEEDS_FCNTL  # pragma: needs fcntl
+def test_injected_unlock_failure_spares_unrelated_flock_calls(tmp_path: Path, mocker: MockerFixture) -> None:
+    # Replay, in order on one thread, an unrelated unlock landing between installing the injection and the target's
+    # unlock: it must reach the real flock and leave the injected failure for the target.
+    fds: Final = [
+        os.open(str(tmp_path / name), os.O_RDWR | os.O_CREAT) for name in ("target", "other", "other", "target")
+    ]
+    target, unrelated, unrelated_probe, target_probe = fds
+    try:
+        assert [lock_descriptor(fd, blocking=False) for fd in (target, unrelated)] == [True, True]
+        _fail_next_unlock(mocker, target)
+        unlock_descriptor(unrelated)
+        assert lock_descriptor(unrelated_probe, blocking=False) is True  # really unlocked, and took no failure
+        with pytest.raises(OSError, match="unlock failed"):
+            unlock_descriptor(target)
+        assert lock_descriptor(target_probe, blocking=False) is False  # the failed unlock left the kernel lock held
+        unlock_descriptor(target)
+        assert lock_descriptor(target_probe, blocking=False) is True  # the retry reached the real flock
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
 @NEEDS_FCNTL  # pragma: needs fcntl
 def test_unix_release_keeps_lock_held_when_unlock_fails(tmp_path: Path, mocker: MockerFixture) -> None:
     lock = FileLock(str(tmp_path / "a"))
     lock.acquire()
-    mocker.patch("filelock._unix.fcntl.flock", side_effect=[OSError(EIO, "unlock failed"), None])
+    _fail_next_unlock(mocker, cast("int", lock._context.lock_file_fd))
     with pytest.raises(OSError, match="unlock failed"):
         lock.release()
     assert lock.is_locked
@@ -2217,12 +2258,13 @@ def test_unix_release_keeps_lock_held_when_unlock_fails(tmp_path: Path, mocker: 
 
 @NEEDS_FCNTL  # pragma: needs fcntl
 def test_unix_context_exit_propagates_unlock_failure(tmp_path: Path, mocker: MockerFixture) -> None:
-    # One LOCK_EX for acquire, then one LOCK_UN per release; fail only the first unlock so __exit__ propagates it.
-    mocker.patch("filelock._unix.fcntl.flock", side_effect=[None, OSError(EIO, "unlock failed"), None])
-    lock = FileLock(str(tmp_path / "a"))
+    # Entry takes the real kernel lock, then the hook fails only that descriptor's first unlock, which __exit__ raises.
+    lock = FileLock(str(tmp_path / "a"), on_acquired=lambda fd: _fail_next_unlock(mocker, fd))
     with pytest.raises(OSError, match="unlock failed"), lock:
         assert lock.is_locked
     assert lock.is_locked
+    with pytest.raises(Timeout):
+        FileLock(str(tmp_path / "a"), blocking=False).acquire()  # the kernel lock is still held after the failed exit
     lock.release()
     assert not lock.is_locked
 
@@ -2594,11 +2636,18 @@ def test_close_error_raise_is_exact_and_committed(tmp_path: Path, mocker: Mocker
 def test_close_not_reached_when_unlock_fails(tmp_path: Path, mocker: MockerFixture) -> None:
     lock = FileLock(str(tmp_path / "a"), close_error_policy="raise")
     lock.acquire()
-    fd = lock._context.lock_file_fd
-    mocker.patch("filelock._unix.fcntl.flock", side_effect=[OSError(EIO, "unlock failed"), None])
+    fd = cast("int", lock._context.lock_file_fd)
+    _fail_next_unlock(mocker, fd)
     real_close = os.close
     closed: list[int] = []
-    mocker.patch("filelock._api.os.close", side_effect=lambda target: closed.append(target) or real_close(target))
+
+    def close(target: int) -> None:
+        # os.close is patched process-wide too, so record only this lock's descriptor.
+        if target == fd:  # pragma: no branch  # only an unrelated close (e.g. another thread's) skips the record
+            closed.append(target)
+        real_close(target)
+
+    mocker.patch("filelock._api.os.close", side_effect=close)
     with pytest.raises(OSError, match="unlock failed"):
         lock.release()
     assert lock.is_locked  # the kernel unlock failed, so the lock is still held
@@ -2849,7 +2898,7 @@ def test_unlock_descriptor_failure_allows_retry(tmp_path: Path, mocker: MockerFi
     fd = os.open(str(tmp_path / "a"), os.O_RDWR | os.O_CREAT)
     try:
         assert lock_descriptor(fd, blocking=False) is True
-        mocker.patch("filelock._unix.fcntl.flock", side_effect=[OSError(EIO, "unlock failed"), None])
+        _fail_next_unlock(mocker, fd)
         with pytest.raises(OSError, match="unlock failed"):
             unlock_descriptor(fd)
         unlock_descriptor(fd)  # the same descriptor can retry

@@ -55,6 +55,7 @@ from tests.capability_marks import (
     NEEDS_PARENT_SYMLINK_COLLAPSE,
     NEEDS_PROMPT_FINALIZATION,
     NEEDS_SYMLINK,
+    NEEDS_UNLINK_OPEN_FILE,
 )
 
 if TYPE_CHECKING:
@@ -1554,6 +1555,52 @@ def test_stale_inode_retry_on_unlinked_lock(tmp_path: Path, mocker: MockerFixtur
     assert lock.is_locked
     assert call_count == 2
     lock.release()
+
+
+@NEEDS_FCNTL  # pragma: needs fcntl
+@NEEDS_UNLINK_OPEN_FILE  # pragma: needs unlink-open-file
+def test_unlinked_holder_release_spares_the_replacement(tmp_path: Path) -> None:
+    # An advisory lock cannot stop a peer unlinking the held path, so a replacement locks the recreated file while the
+    # original still holds the orphaned inode. The original's release must leave the replacement's pathname, kernel lock
+    # and same-thread deadlock registration alone.
+    lock_path: Final = tmp_path / "a.lock"
+    acquired_fds: Final[list[int]] = []
+
+    def native_lock() -> UnixFileLock:
+        return UnixFileLock(lock_path, is_singleton=False, fallback_to_soft=False, on_acquired=acquired_fds.append)
+
+    original: Final = native_lock()
+    replacement: Final = native_lock()
+    original.acquire()
+    try:
+        held: Final = os.fstat(acquired_fds[0])
+        lock_path.unlink()
+        replacement.acquire(timeout=0)
+        try:
+            live: Final = os.fstat(acquired_fds[1])
+            on_disk = lock_path.stat()
+            assert os.fstat(acquired_fds[0]).st_nlink == 0
+            assert (held.st_dev, held.st_ino) != (live.st_dev, live.st_ino)
+            assert (on_disk.st_dev, on_disk.st_ino) == (live.st_dev, live.st_ino)
+
+            original.release()
+
+            on_disk = lock_path.stat()
+            assert replacement.is_locked
+            assert (on_disk.st_dev, on_disk.st_ino) == (live.st_dev, live.st_ino)
+            with pytest.raises(Timeout):
+                native_lock().acquire(blocking=False)
+            # Without the replacement's registry entry the deadlock check stays silent and only the cancel check ends
+            # the wait.
+            with pytest.raises(RuntimeError, match="Deadlock"):
+                native_lock().acquire(cancel_check=lambda: True)
+        finally:
+            replacement.release()
+    finally:
+        original.release()
+
+    with native_lock().acquire(timeout=0) as successor:
+        assert successor.is_locked
 
 
 @NEEDS_FCNTL  # pragma: needs fcntl

@@ -16,7 +16,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from decimal import Decimal
-from errno import EAGAIN, EINTR, EIO, ENOSPC, ENOSYS, EWOULDBLOCK
+from errno import EAGAIN, EBADF, EINTR, EIO, ENOSPC, ENOSYS, EWOULDBLOCK
 from fractions import Fraction
 from inspect import getframeinfo, stack
 from itertools import count
@@ -2643,11 +2643,28 @@ def test_close_not_reached_when_unlock_fails(tmp_path: Path, mocker: MockerFixtu
 
     def close(target: int) -> None:
         # os.close is patched process-wide too, so record only this lock's descriptor.
-        if target == fd:  # pragma: no branch  # only an unrelated close (e.g. another thread's) skips the record
+        if target == fd:
             closed.append(target)
         real_close(target)
 
     mocker.patch("filelock._api.os.close", side_effect=close)
+    # An unrelated close, as another thread's could be, must pass through unrecorded and really close: the descriptor is
+    # gone and the flock it held goes with it, so a probe of the same file then locks without waiting.
+    probe = os.open(str(tmp_path / "b"), os.O_RDWR | os.O_CREAT)
+    try:
+        unrelated = os.open(str(tmp_path / "b"), os.O_RDWR | os.O_CREAT)
+        try:
+            assert lock_descriptor(unrelated, blocking=False) is True
+        finally:
+            os.close(unrelated)
+        # Checked before this test opens anything else, so it cannot have handed the number to a new descriptor yet.
+        with pytest.raises(OSError, match=rf"^\[Errno {EBADF}\] ") as exc_info:
+            os.fstat(unrelated)
+        assert exc_info.value.errno == EBADF
+        assert closed == []
+        assert lock_descriptor(probe, blocking=False) is True
+    finally:
+        os.close(probe)
     with pytest.raises(OSError, match="unlock failed"):
         lock.release()
     assert lock.is_locked  # the kernel unlock failed, so the lock is still held

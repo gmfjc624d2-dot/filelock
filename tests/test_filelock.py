@@ -59,7 +59,7 @@ from tests.capability_marks import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterator
+    from collections.abc import Callable, Generator, Iterable, Iterator
 
     from _typeshed import Unused
     from pytest_mock import MockerFixture
@@ -297,13 +297,82 @@ class ExThread(threading.Thread):
     def run(self) -> None:
         try:
             super().run()
-        except Exception:  # pragma: no cover  # a worker that raises fails the test; a healthy run never lands here
+        except Exception:
             self.ex = sys.exc_info()
 
     def join(self, timeout: float | None = None) -> None:
         super().join(timeout=timeout)
         if self.ex is not None:
-            raise RuntimeError from self.ex[1]  # pragma: no cover  # only a worker that raised gets re-raised here
+            raise RuntimeError from self.ex[1]
+
+
+def _start_and_join(threads: Iterable[ExThread]) -> None:
+    # Join every worker that started even after a start or a worker fails, so none outlives the test to race later ones,
+    # then raise every failure together. A stuck worker still holds its join until pytest-timeout, as on success.
+    started: list[ExThread] = []
+    errors: list[Exception] = []
+    try:
+        for thread in threads:
+            thread.start()
+            started.append(thread)
+    except RuntimeError as error:  # e.g. "can't start new thread": start no more, but join those already running
+        errors.append(error)
+    for thread in started:
+        try:
+            thread.join()
+        except RuntimeError as error:  # ExThread re-raises a worker's failure once that worker has finished
+            errors.append(error)
+    if errors:
+        msg = "worker threads failed"
+        raise ExceptionGroup(msg, errors)
+
+
+def test_start_and_join_joins_started_workers_and_reports_every_failure() -> None:
+    # The last worker finishes only once something joins it, so a failure that ended the joining early would leave it
+    # blocked; the start failure stops further starts. Every failure must reach the raised group.
+    joined, finished = threading.Event(), threading.Event()
+
+    def fail(message: str) -> Callable[[], None]:
+        def run() -> None:
+            raise ValueError(message)
+
+        return run
+
+    def finish_once_joined() -> None:
+        assert joined.wait(_SHARED_WAIT)  # bounded, so a skipped join fails here rather than hangs
+        finished.set()
+
+    class FinishesWhenJoined(ExThread):
+        def join(self, timeout: float | None = None) -> None:
+            joined.set()
+            super().join(timeout)
+
+    class Unstartable(ExThread):
+        def start(self) -> None:  # ruff:ignore[no-self-use]  # overrides a base instance method
+            msg = "can't start new thread"
+            raise RuntimeError(msg)
+
+    threads: Final = [
+        ExThread(fail("first worker failed"), "first"),
+        ExThread(fail("second worker failed"), "second"),
+        FinishesWhenJoined(finish_once_joined, "joined"),
+        Unstartable(fail("never runs"), "unstartable"),
+        ExThread(fail("never runs"), "after-unstartable"),
+    ]
+    try:
+        with pytest.raises(ExceptionGroup, match="worker threads failed") as info:
+            _start_and_join(threads)
+        assert finished.is_set()
+        assert [thread.name for thread in threads if thread.is_alive()] == []
+        assert threads[-1].ident is None  # nothing starts after a start fails
+        start_error, *worker_errors = info.value.exceptions
+        assert str(start_error) == "can't start new thread"
+        assert [str(error.__cause__) for error in worker_errors] == ["first worker failed", "second worker failed"]
+    finally:
+        joined.set()
+        for thread in threads:
+            if thread.ident is not None:
+                threading.Thread.join(thread, _SHARED_WAIT)
 
 
 # 100 threads x 100 acquisitions take over 40 s on GraalPy and strain the 20 s default on a loaded Windows runner.
@@ -324,11 +393,7 @@ def test_threaded_shared_lock_obj(lock_type: type[BaseFileLock], tmp_path: Path)
             with lock:
                 assert lock.is_locked
 
-    threads = [ExThread(target=thread_work, name=f"t{i}") for i in range(100)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    _start_and_join([ExThread(target=thread_work, name=f"t{i}") for i in range(100)])
 
     assert not lock.is_locked
 
@@ -353,14 +418,7 @@ def test_threaded_lock_different_lock_obj(lock_type: type[BaseFileLock], tmp_pat
 
     lock_path = tmp_path / "a"
     lock_1, lock_2 = lock_type(str(lock_path)), lock_type(str(lock_path))
-    threads = [(ExThread(t_1, f"t1_{i}"), ExThread(t_2, f"t2_{i}")) for i in range(10)]
-
-    for thread_1, thread_2 in threads:
-        thread_1.start()
-        thread_2.start()
-    for thread_1, thread_2 in threads:
-        thread_1.join()
-        thread_2.join()
+    _start_and_join([ExThread(work, f"{prefix}_{i}") for i in range(10) for work, prefix in ((t_1, "t1"), (t_2, "t2"))])
 
     assert not lock_1.is_locked
     assert not lock_2.is_locked

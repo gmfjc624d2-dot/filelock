@@ -286,6 +286,22 @@ def _enforces_file_permissions() -> bool:
         return False
 
 
+def _refuses_to_write_a_read_only_file() -> bool:
+    # Not "file-permissions": Windows enforces the read-only attribute on every writer yet never hides a file from a
+    # reader, and CAP_DAC_READ_SEARCH bypasses read checks but not write checks.
+    with tempfile.TemporaryDirectory() as directory:
+        probe: Final[Path] = Path(directory, "probe")
+        probe.touch()
+        probe.chmod(0o400)
+        try:
+            probe.write_bytes(b"")
+        except PermissionError:
+            return True
+        finally:
+            probe.chmod(0o600)
+        return False
+
+
 @contextmanager
 def _unreadable_file() -> Generator[Path]:
     with tempfile.TemporaryDirectory() as directory:
@@ -331,6 +347,7 @@ CAPABILITIES: Final[dict[str, bool]] = {
     "prompt-signal-delivery": _runs_a_raised_signal_handler_at_once(),
     "file-mode": _supports_file_mode(),
     "file-permissions": _enforces_file_permissions(),
+    "read-only-file": _refuses_to_write_a_read_only_file(),
     "prompt-finalization": _finalizes_on_last_reference(),
     "collected-finalization": _finalizes_on_collection(),
     "class-collection": _collects_classes(),

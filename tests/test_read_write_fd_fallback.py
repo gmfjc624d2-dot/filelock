@@ -22,7 +22,7 @@ from tests.capability_marks import NEEDS_FILE_PERMISSIONS
 from tests.read_write_helpers import assert_read_write_lock_state
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterator
 
     from pytest_mock import MockerFixture, MockType
 
@@ -215,6 +215,31 @@ def test_missing_descriptor_path_links_in_a_directory_it_cannot_list(database: P
             assert_read_write_lock_state(str(database), "write", available=False)
     finally:
         database.parent.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(PermissionError(errno.EACCES, "cannot list"), id="access-denied"),
+        pytest.param(OSError(errno.EIO, "cannot list"), id="io-error"),
+    ],
+)
+def test_missing_descriptor_path_links_when_the_sweep_cannot_list(
+    database: Path, mocker: MockerFixture, error: OSError
+) -> None:
+    # The test above needs a runtime that enforces permissions; this one fails the listing wherever it runs. Only the
+    # sweep lists the parent; removing a link directory lists that directory, and must keep working.
+    scandir: Final = os.scandir
+
+    def fail_to_list_the_parent(path: int | str | os.PathLike[str]) -> Iterator[os.DirEntry[str]]:
+        if path == database.parent:
+            raise error
+        return scandir(path)
+
+    listing: Final = mocker.patch("os.scandir", autospec=True, side_effect=fail_to_list_the_parent)
+    with ReadWriteLock(database, is_singleton=False).read_lock():
+        assert_read_write_lock_state(str(database), "write", available=False)
+    listing.assert_any_call(database.parent)
 
 
 _PROCESS_DEADLINE: Final = 30

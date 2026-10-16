@@ -63,6 +63,11 @@ NEEDS_FILE_PERMISSIONS: Final[pytest.MarkDecorator] = pytest.mark.skipif(
     reason="requires enforced file permissions",
 )
 
+NEEDS_READ_ONLY_FILE: Final[pytest.MarkDecorator] = pytest.mark.skipif(
+    not CAPABILITIES["read-only-file"],
+    reason="requires a file without write permission to refuse writes",
+)
+
 NEEDS_UNLINK_OPEN_FILE: Final[pytest.MarkDecorator] = pytest.mark.skipif(
     not CAPABILITIES["unlink-open-file"],
     reason="this runtime keeps an open marker undeletable, so no peer can take it from a live holder",
@@ -118,6 +123,7 @@ __all__ = [
     "NEEDS_PARENT_SYMLINK_COLLAPSE",
     "NEEDS_POSIX_SIGNALS",
     "NEEDS_PROMPT_FINALIZATION",
+    "NEEDS_READ_ONLY_FILE",
     "NEEDS_REGISTER_AT_FORK",
     "NEEDS_SYMLINK",
     "NEEDS_UNLINK_OPEN_FILE",

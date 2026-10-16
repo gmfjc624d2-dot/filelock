@@ -13,17 +13,18 @@ import pytest
 
 from filelock import SoftFileLock, Timeout
 from filelock._identity import host_name
-from tests.capability_marks import NEEDS_FILE_PERMISSIONS, NEEDS_SYMLINK, NEEDS_UNLINK_OPEN_FILE
+from tests.capability_marks import (
+    NEEDS_FILE_PERMISSIONS,
+    NEEDS_READ_ONLY_FILE,
+    NEEDS_SYMLINK,
+    NEEDS_UNLINK_OPEN_FILE,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
     from pytest_mock import MockerFixture
 
-_SKIP_AS_ROOT: Final[pytest.MarkDecorator] = pytest.mark.skipif(
-    sys.platform != "win32" and os.geteuid() == 0,
-    reason="root can write a 0o444 file",
-)
 # Linux and macOS cap PIDs below 2**22 + 1, and Windows answers OpenProcess for it with an invalid-parameter error, so
 # the marker names a holder every platform reads as dead.
 _DEAD_HOLDER: Final[str] = f"{2**22 + 1}\n{host_name()}\n"
@@ -189,7 +190,7 @@ def test_writability_check_does_not_follow_symlink_to_dir(tmp_path: Path) -> Non
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink + 0o444 semantics differ on Windows")
-@_SKIP_AS_ROOT  # pragma: win32 no cover
+@NEEDS_READ_ONLY_FILE  # pragma: win32 no cover  # pragma: needs read-only-file
 def test_writability_check_does_not_follow_symlink_to_readonly(tmp_path: Path) -> None:
     (target := tmp_path / "readonly").write_text("x", encoding="utf-8")
     target.chmod(0o444)
@@ -219,7 +220,7 @@ def test_writability_check_rejects_a_directory(tmp_path: Path, mode: int, mtime:
         path.chmod(0o755)
 
 
-@_SKIP_AS_ROOT
+@NEEDS_READ_ONLY_FILE  # pragma: needs read-only-file
 @pytest.mark.parametrize("mtime", [pytest.param(0, id="mtime-zero"), pytest.param(2_000_000_000, id="mtime-future")])
 def test_writability_check_rejects_a_readonly_file(tmp_path: Path, mtime: int) -> None:
     (path := tmp_path / "ro.lock").write_text("x", encoding="utf-8")
@@ -312,3 +313,35 @@ def test_file_permissions_probe_propagates_io_errors(error: OSError) -> None:
 @pytest.fixture
 def _read_failure(mocker: MockerFixture, error: OSError | None) -> None:
     mocker.patch.object(Path, "read_bytes", autospec=True, side_effect=error, return_value=b"")
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        pytest.param(None, False, id="privileged"),
+        pytest.param(PermissionError(EACCES, "denied"), True, id="access-denied"),
+        pytest.param(PermissionError(EPERM, "denied"), True, id="operation-denied"),
+    ],
+)
+@pytest.mark.usefixtures("_write_failure")
+def test_read_only_file_capability(*, expected: bool) -> None:
+    assert runpy.run_module("capabilities")["CAPABILITIES"]["read-only-file"] is expected
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(OSError(EIO, "probe failed"), id="io-error"),
+        pytest.param(OSError(ENOENT, "probe failed"), id="missing-file"),
+    ],
+)
+@pytest.mark.usefixtures("_write_failure")
+def test_read_only_file_probe_propagates_io_errors(error: OSError) -> None:
+    with pytest.raises(OSError, match="probe failed") as raised:
+        runpy.run_module("capabilities")
+    assert raised.value is error
+
+
+@pytest.fixture
+def _write_failure(mocker: MockerFixture, error: OSError | None) -> None:
+    mocker.patch.object(Path, "write_bytes", autospec=True, side_effect=error, return_value=0)

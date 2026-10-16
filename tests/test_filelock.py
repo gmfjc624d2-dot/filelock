@@ -54,6 +54,7 @@ from tests.capability_marks import (
     NEEDS_FILE_PERMISSIONS,
     NEEDS_PARENT_SYMLINK_COLLAPSE,
     NEEDS_PROMPT_FINALIZATION,
+    NEEDS_READ_ONLY_FILE,
     NEEDS_SYMLINK,
     NEEDS_UNLINK_OPEN_FILE,
 )
@@ -110,7 +111,7 @@ def test_documented_cache_lock_name(tmp_path: Path, key: str) -> None:
 
 
 @contextmanager
-def make_ro(path: Path) -> Generator[None]:
+def make_ro(path: Path) -> Generator[None]:  # pragma: needs read-only-file
     write = S_IWUSR | S_IWGRP | S_IWOTH
     path.chmod(path.stat().st_mode & ~write)
     try:
@@ -134,7 +135,7 @@ def test_ro_folder(lock_type: type[BaseFileLock], tmp_path_ro: Path) -> None:
 
 
 @pytest.fixture
-def tmp_file_ro(tmp_path: Path) -> Iterator[Path]:
+def tmp_file_ro(tmp_path: Path) -> Iterator[Path]:  # pragma: needs read-only-file
     filename = tmp_path / "a"
     filename.write_text("")
     with make_ro(filename):
@@ -142,10 +143,7 @@ def tmp_file_ro(tmp_path: Path) -> Iterator[Path]:
 
 
 @pytest.mark.parametrize("lock_type", [FileLock, SoftFileLock])
-@pytest.mark.skipif(
-    sys.platform != "win32" and os.geteuid() == 0,
-    reason="Cannot make a read only file (that the current user: root can't read)",
-)
+@NEEDS_READ_ONLY_FILE  # pragma: needs read-only-file
 def test_ro_file(lock_type: type[BaseFileLock], tmp_file_ro: Path) -> None:
     lock = lock_type(str(tmp_file_ro))
     with pytest.raises(PermissionError, match="Permission denied"):
@@ -1402,7 +1400,7 @@ def test_file_lock_positional_argument(tmp_path: Path) -> None:
     assert lock.lock_file == str(lock_path) + ".lock"
 
 
-@pytest.mark.skipif(sys.platform != "win32" and os.geteuid() == 0, reason="root can open a 0o444 file for writing")
+@NEEDS_READ_ONLY_FILE  # pragma: needs read-only-file
 @pytest.mark.parametrize("lock_type", [SoftFileLock, FileLock])
 def test_readonly_lock_file_with_mtime_zero_raises(lock_type: type[BaseFileLock], tmp_path: Path) -> None:
     # acquire() no longer short-circuits the writability check on mtime 0, so a read-only lock file is still rejected.
